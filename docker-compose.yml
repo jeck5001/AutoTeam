@@ -1,6 +1,6 @@
 services:
   autoteam:
-    build: .
+    image: ${AUTOTEAM_IMAGE:-ghcr.io/jeck5001/autoteam:latest}
     ports:
       - "8787:8787"
     volumes:

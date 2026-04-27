@@ -13,6 +13,10 @@ ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
 
+LABEL org.opencontainers.image.source="https://github.com/jeck5001/AutoTeam"
+LABEL org.opencontainers.image.description="AutoTeam service image built from the jeck5001 fork."
+LABEL org.opencontainers.image.licenses="MIT"
+
 # 复制项目文件
 COPY pyproject.toml uv.lock ./
 RUN uv sync --no-dev

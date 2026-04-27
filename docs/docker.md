@@ -3,13 +3,14 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/cnitlrt/AutoTeam.git
+git clone https://github.com/jeck5001/AutoTeam.git
 cd AutoTeam
 
 mkdir -p data
 cp .env.example data/.env
 
 # 编辑 data/.env
+docker compose pull
 docker compose up -d
 ```
 
@@ -17,8 +18,28 @@ docker compose up -d
 
 ```bash
 docker compose logs -f
+docker compose pull
+docker compose up -d
 docker compose restart
 docker compose down
+```
+
+默认使用镜像：
+
+```text
+ghcr.io/jeck5001/autoteam:latest
+```
+
+如需固定到某个版本，可在同目录创建 `.env` 或导出环境变量：
+
+```env
+AUTOTEAM_IMAGE=ghcr.io/jeck5001/autoteam:sha-xxxxxxxx
+```
+
+然后执行：
+
+```bash
+docker compose up -d
 ```
 
 ## 数据持久化
@@ -43,6 +64,17 @@ docker compose down
 docker build -t autoteam .
 docker run -d -p 8787:8787 -v $(pwd)/data:/app/data autoteam
 ```
+
+## GitHub Actions 构建
+
+Fork 仓库的 `dev` 分支有新提交后，会自动由 GitHub Actions 构建并推送到 GHCR。
+
+- `latest`: 跟随默认分支 `dev`
+- `dev`: 分支标签
+- `sha-<commit>`: 具体提交版本
+- `v*`: 当你推送版本 tag 时会生成同名 tag
+
+由于镜像在首次发布前就已经绑定到 `https://github.com/jeck5001/AutoTeam`，容器包会继承这个公开仓库的可见性，NAS 可以直接匿名拉取。
 
 ## 配置方式
 

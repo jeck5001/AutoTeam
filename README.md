@@ -70,10 +70,13 @@ uv run autoteam rotate
 ### Docker
 
 ```bash
-git clone https://github.com/cnitlrt/AutoTeam.git && cd AutoTeam
+git clone https://github.com/jeck5001/AutoTeam.git && cd AutoTeam
 mkdir -p data && cp .env.example data/.env
+docker compose pull
 docker compose up -d
 ```
+
+默认会拉取 `ghcr.io/jeck5001/autoteam:latest`，适合在 NAS 上直接更新部署。
 
 ## 配置原则
 
