@@ -160,28 +160,28 @@
         <div v-else-if="!codexBusy" class="flex flex-wrap gap-3">
           <button
             @click="loginMainCodex"
-            :disabled="submitting || syncingMain || deletingMainCpa"
+            :disabled="submitting || syncingMain || deletingMainRemoteFiles"
             class="px-4 py-2 bg-blue-700 hover:bg-blue-600 text-white text-sm rounded-lg transition disabled:opacity-50"
           >
             {{ syncingMain && mainCodexSubmittingAction === 'login' ? '登录中...' : '登录主号 Codex' }}
           </button>
           <button
             @click="syncMainCodex"
-            :disabled="submitting || syncingMain || deletingMainCpa"
+            :disabled="submitting || syncingMain || deletingMainRemoteFiles"
             class="px-4 py-2 bg-cyan-700 hover:bg-cyan-600 text-white text-sm rounded-lg transition disabled:opacity-50"
           >
             {{ syncingMain && mainCodexSubmittingAction === 'sync' ? '同步中...' : '同步主号 Codex 到已启用远端' }}
           </button>
           <button
-            @click="deleteMainCodexFromCpa"
-            :disabled="submitting || syncingMain || deletingMainCpa"
+            @click="deleteMainCodexFromRemoteFiles"
+            :disabled="submitting || syncingMain || deletingMainRemoteFiles"
             class="px-4 py-2 bg-amber-700 hover:bg-amber-600 text-white text-sm rounded-lg transition disabled:opacity-50"
           >
-            {{ deletingMainCpa ? '删除中...' : '从 CPA 删除主号文件' }}
+            {{ deletingMainRemoteFiles ? '删除中...' : '从已启用远端删除主号文件' }}
           </button>
           <button
             @click="logoutAdmin"
-            :disabled="submitting || syncingMain || deletingMainCpa"
+            :disabled="submitting || syncingMain || deletingMainRemoteFiles"
             class="px-4 py-2 bg-rose-700/80 hover:bg-rose-700 text-white text-sm rounded-lg transition disabled:opacity-50"
           >
             {{ submitting ? '处理中...' : '清除登录态' }}
@@ -337,13 +337,21 @@
         <span v-if="saved" class="text-xs text-green-400 transition">已保存</span>
       </div>
 
-      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+      <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-6">
         <div>
           <label class="block text-sm text-gray-400 mb-1">巡检间隔</label>
           <div class="flex items-center gap-2">
             <input v-model.number="form.interval" type="number" min="1"
               class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500" />
             <span class="text-sm text-gray-500 shrink-0">分钟</span>
+          </div>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">总 seat 数</label>
+          <div class="flex items-center gap-2">
+            <input v-model.number="form.target_seats" type="number" min="1"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500" />
+            <span class="text-sm text-gray-500 shrink-0">个</span>
           </div>
         </div>
         <div>
@@ -362,11 +370,36 @@
             <span class="text-sm text-gray-500 shrink-0">个</span>
           </div>
         </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">手机号验证自动重试</label>
+          <select
+            v-model="form.retry_add_phone"
+            class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500"
+          >
+            <option :value="true">开启</option>
+            <option :value="false">关闭</option>
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-400 mb-1">手机号验证最大重试</label>
+          <div class="flex items-center gap-2">
+            <input
+              v-model.number="form.add_phone_max_retries"
+              type="number"
+              min="1"
+              class="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white focus:outline-none focus:border-blue-500"
+            />
+            <span class="text-sm text-gray-500 shrink-0">次</span>
+          </div>
+        </div>
       </div>
 
       <div class="mt-3 flex items-center justify-between gap-3">
         <p class="text-xs text-gray-500">
-          每 {{ form.interval }} 分钟检查一次，{{ form.min_low }} 个以上账号剩余低于 {{ form.threshold }}% 时自动轮转
+          每 {{ form.interval }} 分钟检查一次，按 Team 总 seat {{ form.target_seats }} 个做自动轮转 / 补位判断；
+          {{ form.min_low }} 个以上账号剩余低于 {{ form.threshold }}% 时自动轮转；
+          <span v-if="form.target_seats === 2">seat=2 时会对低额度子号启用 best-effort 预切换，若满员无法先加新号则自动回退到先移后补；</span>
+          add_phone {{ form.retry_add_phone ? `开启自动重试（最多 ${form.add_phone_max_retries} 次）` : '保持人工处理' }}
         </p>
         <button @click="save" :disabled="saving"
           class="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg transition disabled:opacity-50">
@@ -398,7 +431,7 @@ const props = defineProps({
 
 const emit = defineEmits(['refresh', 'admin-progress'])
 
-const form = ref({ interval: 5, threshold: 10, min_low: 2 })
+const form = ref({ interval: 5, target_seats: 5, threshold: 10, min_low: 2, retry_add_phone: true, add_phone_max_retries: 3 })
 const saving = ref(false)
 const saved = ref(false)
 
@@ -414,7 +447,7 @@ const codexCode = ref('')
 const submitting = ref(false)
 const syncingMain = ref(false)
 const mainCodexSubmittingAction = ref('')
-const deletingMainCpa = ref(false)
+const deletingMainRemoteFiles = ref(false)
 const message = ref('')
 const messageClass = ref('')
 const adminSubmittingHint = ref('')
@@ -483,8 +516,11 @@ async function loadAutoCheckConfig() {
     const cfg = await api.getAutoCheckConfig()
     form.value = {
       interval: Math.round(cfg.interval / 60),
+      target_seats: cfg.target_seats ?? 5,
       threshold: cfg.threshold,
       min_low: cfg.min_low,
+      retry_add_phone: cfg.retry_add_phone ?? true,
+      add_phone_max_retries: cfg.add_phone_max_retries ?? 3,
     }
   } catch (e) {
     console.error('加载巡检配置失败:', e)
@@ -680,16 +716,16 @@ async function cancelMainCodexSync() {
   }
 }
 
-async function deleteMainCodexFromCpa() {
-  deletingMainCpa.value = true
+async function deleteMainCodexFromRemoteFiles() {
+  deletingMainRemoteFiles.value = true
   try {
-    const result = await api.deleteMainCodexFromCpa()
-    setMessage(result.message || '已从 CPA 删除主号文件')
+    const result = await api.deleteMainCodexFromRemoteFiles()
+    setMessage(result.message || '已从已启用远端删除主号文件')
     emit('refresh')
   } catch (e) {
     setMessage(e.message, 'error')
   } finally {
-    deletingMainCpa.value = false
+    deletingMainRemoteFiles.value = false
   }
 }
 
@@ -699,13 +735,19 @@ async function save() {
   try {
     const cfg = await api.setAutoCheckConfig({
       interval: form.value.interval * 60,
+      target_seats: form.value.target_seats,
       threshold: form.value.threshold,
       min_low: form.value.min_low,
+      retry_add_phone: !!form.value.retry_add_phone,
+      add_phone_max_retries: form.value.add_phone_max_retries,
     })
     form.value = {
       interval: Math.round(cfg.interval / 60),
+      target_seats: cfg.target_seats ?? 5,
       threshold: cfg.threshold,
       min_low: cfg.min_low,
+      retry_add_phone: cfg.retry_add_phone ?? true,
+      add_phone_max_retries: cfg.add_phone_max_retries ?? 3,
     }
     saved.value = true
     setTimeout(() => { saved.value = false }, 3000)

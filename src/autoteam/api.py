@@ -159,8 +159,11 @@ _ALL_RUNTIME_ENV_KEYS = [
     "EMAIL_POLL_TIMEOUT",
     "API_KEY",
     "AUTO_CHECK_INTERVAL",
+    "AUTO_CHECK_TARGET_SEATS",
     "AUTO_CHECK_THRESHOLD",
     "AUTO_CHECK_MIN_LOW",
+    "AUTO_CHECK_RETRY_ADD_PHONE",
+    "AUTO_CHECK_ADD_PHONE_MAX_RETRIES",
     "PLAYWRIGHT_PROXY_URL",
     "PLAYWRIGHT_PROXY_SERVER",
     "PLAYWRIGHT_PROXY_USERNAME",
@@ -577,11 +580,21 @@ def _sync_runtime_globals():
         return
 
     try:
-        from autoteam.config import AUTO_CHECK_INTERVAL, AUTO_CHECK_MIN_LOW, AUTO_CHECK_THRESHOLD
+        from autoteam.config import (
+            AUTO_CHECK_ADD_PHONE_MAX_RETRIES,
+            AUTO_CHECK_INTERVAL,
+            AUTO_CHECK_MIN_LOW,
+            AUTO_CHECK_RETRY_ADD_PHONE,
+            AUTO_CHECK_TARGET_SEATS,
+            AUTO_CHECK_THRESHOLD,
+        )
 
         auto_check_config["interval"] = AUTO_CHECK_INTERVAL
+        auto_check_config["target_seats"] = AUTO_CHECK_TARGET_SEATS
         auto_check_config["threshold"] = AUTO_CHECK_THRESHOLD
         auto_check_config["min_low"] = AUTO_CHECK_MIN_LOW
+        auto_check_config["retry_add_phone"] = AUTO_CHECK_RETRY_ADD_PHONE
+        auto_check_config["add_phone_max_retries"] = AUTO_CHECK_ADD_PHONE_MAX_RETRIES
         if auto_check_restart is not None:
             auto_check_restart.set()
     except Exception:
@@ -637,20 +650,23 @@ def _maybe_reload_runtime_config_from_env_file(*, force: bool = False):
     return True
 
 
-def _verify_runtime_integrations(previous_env: dict[str, str | None] | None = None):
+def _verify_runtime_integrations(
+    previous_env: dict[str, str | None] | None = None, *, env: dict[str, object] | None = None
+):
     from autoteam.mail_provider import get_mail_provider_name, get_mail_provider_prompt, get_mail_provider_required_keys
     from autoteam.setup_wizard import _verify_cpa, _verify_mail_provider, _verify_sub2api
 
     errors = []
-    mail_provider = get_mail_provider_name()
+    runtime_env = dict(env or os.environ)
+    mail_provider = get_mail_provider_name(runtime_env)
     mail_keys = tuple(get_mail_provider_required_keys(mail_provider))
     cpa_keys = ("CPA_URL", "CPA_KEY")
     sub2api_keys = ("SUB2API_URL", "SUB2API_EMAIL", "SUB2API_PASSWORD")
 
-    mail_values = [os.environ.get(key, "") for key in mail_keys]
-    cpa_values = [os.environ.get(key, "") for key in cpa_keys]
-    sub2api_values = [os.environ.get(key, "") for key in sub2api_keys]
-    sync_states = _effective_sync_target_states()
+    mail_values = [runtime_env.get(key, "") for key in mail_keys]
+    cpa_values = [runtime_env.get(key, "") for key in cpa_keys]
+    sub2api_values = [runtime_env.get(key, "") for key in sub2api_keys]
+    sync_states = _effective_sync_target_states(runtime_env)
 
     if mail_keys and all(mail_values) and not _verify_mail_provider(mail_provider):
         errors.append(f"{get_mail_provider_prompt(mail_provider)} 连接失败")
@@ -699,7 +715,7 @@ def _save_runtime_config(data: dict[str, str]):
             os.environ[key] = value
         _reload_runtime_config_modules()
 
-        verify_result = _verify_runtime_integrations(previous_env)
+        verify_result = _verify_runtime_integrations(previous_env, env=merged)
         if verify_result:
             _restore_runtime_env(previous_env)
             _reload_runtime_config_modules()
@@ -792,7 +808,7 @@ def put_runtime_config_source(config: SourceConfig):
                 os.environ.pop(key, None)
 
         _reload_runtime_config_modules()
-        verify_result = _verify_runtime_integrations(previous_env)
+        verify_result = _verify_runtime_integrations(previous_env, env=loaded_values)
         if verify_result:
             _restore_runtime_source_text(previous_exists, previous_content)
             _restore_runtime_env(previous_env)
@@ -1111,8 +1127,12 @@ def _resolve_status_auth_file(acc: dict) -> str:
 
 
 def _display_account_status(acc: dict, quota_snapshot: dict | None = None) -> str:
+    from autoteam.accounts import is_account_disabled
+
     status = acc.get("status", "")
     if not _is_main_account_email(acc.get("email")):
+        if is_account_disabled(acc):
+            return "disabled"
         return status
 
     quota_status = _quota_snapshot_status(quota_snapshot) or _quota_snapshot_status(acc.get("last_quota"))
@@ -1126,6 +1146,7 @@ def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
     sanitized = {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id", "mail_account_id")}
     sanitized["is_main_account"] = _is_main_account_email(acc.get("email"))
+    sanitized["raw_status"] = acc.get("status", "")
     sanitized["status"] = _display_account_status(acc, quota_snapshot)
     return sanitized
 
@@ -1659,16 +1680,50 @@ def post_main_codex_cancel():
     return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
 
 
+def _delete_main_codex_from_enabled_targets():
+    from autoteam.sync_targets import (
+        delete_main_codex_from_configured_targets,
+        describe_sync_targets,
+        get_enabled_sync_targets,
+    )
+
+    _require_sync_target_configs("删除主号 Codex 远端文件")
+
+    env = _current_runtime_env()
+    enabled_targets = get_enabled_sync_targets(env)
+    results = delete_main_codex_from_configured_targets()
+    deleted: list[str] = []
+    total_count = 0
+
+    for target in enabled_targets:
+        target_result = results.get(target) or {}
+        target_deleted = [str(item) for item in (target_result.get("deleted") or [])]
+        deleted.extend(target_deleted)
+
+        try:
+            target_count = int(target_result.get("count", len(target_deleted)) or 0)
+        except (TypeError, ValueError):
+            target_count = len(target_deleted)
+        total_count += target_count
+
+    target_label = describe_sync_targets(enabled_targets)
+    return {
+        "message": f"已从 {target_label} 删除 {total_count} 个主号认证文件",
+        "deleted": deleted,
+        "results": results,
+    }
+
+
+@app.post("/api/main-codex/delete-remote-files")
+def post_main_codex_delete_remote_files():
+    """删除已启用远端中已上传的主号 Codex 认证文件。"""
+    return _delete_main_codex_from_enabled_targets()
+
+
 @app.post("/api/main-codex/delete-cpa")
 def post_main_codex_delete_cpa():
-    """删除 CPA 中已上传的主号 Codex 认证文件。"""
-    from autoteam.cpa_sync import delete_main_codex_from_cpa
-
-    result = delete_main_codex_from_cpa()
-    return {
-        "message": f"已从 CPA 删除 {result['count']} 个主号认证文件",
-        "deleted": result["deleted"],
-    }
+    """兼容旧接口：删除已启用远端中的主号 Codex 认证文件。"""
+    return _delete_main_codex_from_enabled_targets()
 
 
 @app.post("/api/manual-account/start")
@@ -1835,6 +1890,119 @@ def delete_account(email: str):
         _playwright_lock.release()
 
 
+def _toggle_account_disabled(email: str, disabled: bool):
+    from autoteam.accounts import find_account, load_accounts, update_account
+
+    email = email.strip().lower()
+    if _is_main_account_email(email):
+        raise HTTPException(status_code=400, detail="主号不允许禁用或启用")
+
+    accounts = load_accounts()
+    acc = find_account(accounts, email)
+    if not acc:
+        raise HTTPException(status_code=404, detail="账号不存在")
+
+    update_account(email, disabled=disabled)
+    refreshed = find_account(load_accounts(), email)
+    return {
+        "message": f"已{'禁用' if disabled else '启用'} {email}",
+        "email": email,
+        "disabled": bool(disabled),
+        "account": _sanitize_account(refreshed or {**acc, "disabled": disabled}),
+    }
+
+
+def _toggle_accounts_disabled(emails: list[str], disabled: bool):
+    from autoteam.accounts import load_accounts, save_accounts
+
+    normalized_emails = []
+    seen = set()
+    for value in emails or []:
+        email = _normalized_email(value)
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        normalized_emails.append(email)
+
+    if not normalized_emails:
+        raise HTTPException(status_code=400, detail="请至少提供一个有效邮箱")
+
+    accounts = load_accounts()
+    by_email = {(_normalized_email(acc.get("email"))): acc for acc in accounts if acc.get("email")}
+
+    updated = []
+    unchanged = []
+    missing = []
+    skipped_main = []
+
+    for email in normalized_emails:
+        if _is_main_account_email(email):
+            skipped_main.append(email)
+            continue
+        acc = by_email.get(email)
+        if not acc:
+            missing.append(email)
+            continue
+        if bool(acc.get("disabled", False)) == bool(disabled):
+            unchanged.append(email)
+            continue
+        acc["disabled"] = bool(disabled)
+        updated.append(email)
+
+    if updated:
+        save_accounts(accounts)
+        accounts = load_accounts()
+        by_email = {(_normalized_email(acc.get("email"))): acc for acc in accounts if acc.get("email")}
+
+    action = "禁用" if disabled else "启用"
+    parts = [f"已{action} {len(updated)} 个账号"]
+    if unchanged:
+        parts.append(f"{len(unchanged)} 个已是目标状态")
+    if skipped_main:
+        parts.append(f"跳过主号 {len(skipped_main)} 个")
+    if missing:
+        parts.append(f"未找到 {len(missing)} 个")
+
+    return {
+        "message": "，".join(parts),
+        "disabled": bool(disabled),
+        "updated_count": len(updated),
+        "updated_emails": updated,
+        "unchanged_emails": unchanged,
+        "skipped_main_accounts": skipped_main,
+        "missing_emails": missing,
+        "accounts": [_sanitize_account(by_email[email]) for email in updated if email in by_email],
+    }
+
+
+class BulkAccountDisableParams(BaseModel):
+    emails: list[str]
+
+
+@app.post("/api/accounts/bulk/disable")
+def post_bulk_disable_accounts(params: BulkAccountDisableParams):
+    """批量禁用账号：保留本地记录，但自动轮转/巡检/同步会跳过这些账号。"""
+    return _toggle_accounts_disabled(params.emails, True)
+
+
+@app.post("/api/accounts/bulk/enable")
+def post_bulk_enable_accounts(params: BulkAccountDisableParams):
+    """批量启用账号：恢复这些账号参与自动轮转/巡检/同步。"""
+    return _toggle_accounts_disabled(params.emails, False)
+
+
+@app.post("/api/accounts/{email}/disable")
+def post_disable_account(email: str):
+    """禁用账号：保留本地记录，但自动轮转/巡检/同步会跳过该账号。"""
+    return _toggle_account_disabled(email, True)
+
+
+@app.post("/api/accounts/{email}/enable")
+def post_enable_account(email: str):
+    """启用账号：恢复参与自动轮转/巡检/同步。"""
+    return _toggle_account_disabled(email, False)
+
+
 @app.post("/api/accounts/{email}/kick")
 def post_kick_account(email: str):
     """将账号从 Team 中移出，状态变为 standby"""
@@ -1852,8 +2020,8 @@ def post_kick_account(email: str):
         acc = find_account(accounts, email)
         if not acc:
             raise HTTPException(status_code=404, detail="账号不存在")
-        if acc["status"] != "active":
-            raise HTTPException(status_code=400, detail=f"账号状态为 {acc['status']}，不是 active")
+        if acc["status"] not in ("active", "auth_pending", "exhausted"):
+            raise HTTPException(status_code=400, detail=f"账号状态为 {acc['status']}，当前不在 Team 占位状态")
 
         def _do_kick():
             return _run_with_chatgpt_session(lambda chatgpt: remove_from_team(chatgpt, email))
@@ -1945,6 +2113,7 @@ def get_status():
         STATUS_EXHAUSTED,
         STATUS_PENDING,
         STATUS_STANDBY,
+        is_account_disabled,
         load_accounts,
     )
     from autoteam.codex_auth import check_codex_quota, quota_result_quota_info
@@ -1953,6 +2122,8 @@ def get_status():
     quota_cache = {}
 
     for acc in accounts:
+        if not _is_main_account_email(acc.get("email")) and is_account_disabled(acc):
+            continue
         if acc["status"] not in (STATUS_ACTIVE, STATUS_AUTH_PENDING) and not _is_main_account_email(acc.get("email")):
             continue
 
@@ -1982,6 +2153,7 @@ def get_status():
         "standby": sum(1 for a in sanitized_accounts if a["status"] == STATUS_STANDBY),
         "exhausted": sum(1 for a in sanitized_accounts if a["status"] == STATUS_EXHAUSTED),
         "pending": sum(1 for a in sanitized_accounts if a["status"] == STATUS_PENDING),
+        "disabled": sum(1 for a in sanitized_accounts if a["status"] == "disabled"),
         "total": len(sanitized_accounts),
     }
 
@@ -2275,6 +2447,15 @@ def post_cleanup(params: CleanupParams = CleanupParams()):
     return task
 
 
+@app.post("/api/tasks/reset-quota", status_code=202)
+def post_reset_quota():
+    """清空本地额度恢复记录，并恢复 exhausted 账号为可检查状态（后台执行）"""
+    from autoteam.manager import cmd_reset_quota_recovery
+
+    task = _start_task("reset-quota", cmd_reset_quota_recovery, {})
+    return task
+
+
 @app.get("/api/tasks")
 def get_tasks():
     """查看所有任务"""
@@ -2296,10 +2477,19 @@ def get_task(task_id: str):
 # ---------------------------------------------------------------------------
 
 from autoteam.config import (
+    AUTO_CHECK_ADD_PHONE_MAX_RETRIES as _DEFAULT_ADD_PHONE_MAX_RETRIES,
+)
+from autoteam.config import (
     AUTO_CHECK_INTERVAL as _DEFAULT_INTERVAL,
 )
 from autoteam.config import (
     AUTO_CHECK_MIN_LOW as _DEFAULT_MIN_LOW,
+)
+from autoteam.config import (
+    AUTO_CHECK_RETRY_ADD_PHONE as _DEFAULT_RETRY_ADD_PHONE,
+)
+from autoteam.config import (
+    AUTO_CHECK_TARGET_SEATS as _DEFAULT_TARGET_SEATS,
 )
 from autoteam.config import (
     AUTO_CHECK_THRESHOLD as _DEFAULT_THRESHOLD,
@@ -2308,8 +2498,11 @@ from autoteam.config import (
 # 运行时可修改的巡检配置
 _auto_check_config = {
     "interval": _DEFAULT_INTERVAL,
+    "target_seats": _DEFAULT_TARGET_SEATS,
     "threshold": _DEFAULT_THRESHOLD,
     "min_low": _DEFAULT_MIN_LOW,
+    "retry_add_phone": _DEFAULT_RETRY_ADD_PHONE,
+    "add_phone_max_retries": _DEFAULT_ADD_PHONE_MAX_RETRIES,
 }
 _auto_check_stop = threading.Event()
 _auto_check_restart = threading.Event()  # 配置变更时通知线程重启
@@ -2440,7 +2633,7 @@ def _auto_check_wait(interval_seconds, poll_seconds=0.2):
 
 def _auto_check_loop():
     """后台巡检线程：定期检查额度，多个账号低于阈值时自动轮转"""
-    from autoteam.accounts import STATUS_ACTIVE, STATUS_AUTH_PENDING, load_accounts
+    from autoteam.accounts import STATUS_ACTIVE, STATUS_AUTH_PENDING, is_account_disabled, load_accounts
     from autoteam.codex_auth import check_codex_quota
     from autoteam.manager import (
         _auth_repair_skip_reason,
@@ -2449,22 +2642,24 @@ def _auto_check_loop():
         sync_account_states,
     )
 
-    target_seats = 5
-    pool_active_target = _pool_active_target(target_seats)
-
     def _collect_auto_check_state(accounts, cfg):
         account_by_email = {
             (a.get("email") or "").strip().lower(): a for a in accounts if (a.get("email") or "").strip()
         }
         local_active_count = _count_pool_active_accounts(accounts, require_auth=True)
         auth_pending_accounts = [
-            a for a in accounts if a["status"] == STATUS_AUTH_PENDING and not _is_main_account_email(a.get("email"))
+            a
+            for a in accounts
+            if a["status"] == STATUS_AUTH_PENDING
+            and not _is_main_account_email(a.get("email"))
+            and not is_account_disabled(a)
         ]
         missing_auth_accounts = [
             a
             for a in accounts
             if a["status"] == STATUS_ACTIVE
             and not _is_main_account_email(a.get("email"))
+            and not is_account_disabled(a)
             and not (a.get("auth_file") and Path(a["auth_file"]).exists())
         ]
         active = [
@@ -2472,6 +2667,7 @@ def _auto_check_loop():
             for a in accounts
             if a["status"] == STATUS_ACTIVE
             and not _is_main_account_email(a.get("email"))
+            and not is_account_disabled(a)
             and a.get("auth_file")
             and Path(a["auth_file"]).exists()
         ]
@@ -2534,9 +2730,12 @@ def _auto_check_loop():
             logger.warning("[配置] 自动热加载失败: %s", exc)
 
         cfg = _auto_check_config
+        target_seats = max(1, int(cfg.get("target_seats", _DEFAULT_TARGET_SEATS)))
+        pool_active_target = _pool_active_target(target_seats)
         logger.info(
-            "[巡检] 等待 %d 分钟后执行下一轮检查（阈值: %d%%, 触发: >=%d 个）",
+            "[巡检] 等待 %d 分钟后执行下一轮检查（目标 seat: %d, 阈值: %d%%, 触发: >=%d 个）",
             cfg["interval"] // 60,
+            target_seats,
             cfg["threshold"],
             cfg["min_low"],
         )
@@ -2550,6 +2749,8 @@ def _auto_check_loop():
 
         try:
             cfg = _auto_check_config  # 重新读取
+            target_seats = max(1, int(cfg.get("target_seats", _DEFAULT_TARGET_SEATS)))
+            pool_active_target = _pool_active_target(target_seats)
             accounts = load_accounts()
             state = _collect_auto_check_state(accounts, cfg)
             local_active_count = state["local_active_count"]
@@ -2641,6 +2842,14 @@ def _auto_check_loop():
                     from autoteam.codex_auth import quota_result_quota_info, quota_result_resets_at
 
                     for email, remaining, status, info in low_accounts:
+                        if target_seats == 2 and status == "ok":
+                            logger.info(
+                                "[巡检] %s 剩余 %d%% < %d%%，seat=2 预切换模式暂不预标记 exhausted",
+                                email,
+                                remaining,
+                                cfg["threshold"],
+                            )
+                            continue
                         logger.info("[巡检] %s 剩余 %d%%，标记为 exhausted", email, remaining)
                         status_kwargs = {
                             "status": STATUS_EXHAUSTED,
@@ -2789,31 +2998,50 @@ def _auto_check_loop():
 
 class AutoCheckConfig(BaseModel):
     interval: int = 300  # 巡检间隔（秒）
+    target_seats: int = 5  # 自动巡检目标 Team seat 数
     threshold: int = 10  # 额度阈值（%）
     min_low: int = 2  # 触发轮转的最少账号数
+    retry_add_phone: bool = True  # 是否自动重试 add_phone
+    add_phone_max_retries: int = 3  # add_phone 最大自动重试次数
 
 
-def _normalized_auto_check_config(cfg: AutoCheckConfig | dict[str, int]) -> dict[str, int]:
+def _normalized_auto_check_config(cfg: AutoCheckConfig | dict[str, object]) -> dict[str, int | bool]:
     if isinstance(cfg, AutoCheckConfig):
         interval = cfg.interval
+        target_seats = cfg.target_seats
         threshold = cfg.threshold
         min_low = cfg.min_low
+        retry_add_phone = cfg.retry_add_phone
+        add_phone_max_retries = cfg.add_phone_max_retries
     else:
         interval = cfg.get("interval", _auto_check_config.get("interval", _DEFAULT_INTERVAL))
+        target_seats = cfg.get("target_seats", _auto_check_config.get("target_seats", _DEFAULT_TARGET_SEATS))
         threshold = cfg.get("threshold", _auto_check_config.get("threshold", _DEFAULT_THRESHOLD))
         min_low = cfg.get("min_low", _auto_check_config.get("min_low", _DEFAULT_MIN_LOW))
+        retry_add_phone = cfg.get(
+            "retry_add_phone", _auto_check_config.get("retry_add_phone", _DEFAULT_RETRY_ADD_PHONE)
+        )
+        add_phone_max_retries = cfg.get(
+            "add_phone_max_retries",
+            _auto_check_config.get("add_phone_max_retries", _DEFAULT_ADD_PHONE_MAX_RETRIES),
+        )
 
     return {
         "interval": max(60, int(interval)),
+        "target_seats": max(1, int(target_seats)),
         "threshold": max(1, min(100, int(threshold))),
         "min_low": max(1, int(min_low)),
+        "retry_add_phone": bool(retry_add_phone),
+        "add_phone_max_retries": max(1, int(add_phone_max_retries)),
     }
 
 
 @app.get("/api/config/auto-check")
 def get_auto_check_config():
     """获取巡检配置"""
-    return _auto_check_config.copy()
+    cfg = _auto_check_config.copy()
+    cfg.setdefault("target_seats", _DEFAULT_TARGET_SEATS)
+    return cfg
 
 
 @app.put("/api/config/auto-check")
@@ -2826,8 +3054,11 @@ def set_auto_check_config(cfg: AutoCheckConfig):
 
     persisted = {
         "AUTO_CHECK_INTERVAL": str(normalized["interval"]),
+        "AUTO_CHECK_TARGET_SEATS": str(normalized["target_seats"]),
         "AUTO_CHECK_THRESHOLD": str(normalized["threshold"]),
         "AUTO_CHECK_MIN_LOW": str(normalized["min_low"]),
+        "AUTO_CHECK_RETRY_ADD_PHONE": "true" if normalized["retry_add_phone"] else "false",
+        "AUTO_CHECK_ADD_PHONE_MAX_RETRIES": str(normalized["add_phone_max_retries"]),
     }
     for key, value in persisted.items():
         os.environ[key] = value
@@ -2836,10 +3067,13 @@ def set_auto_check_config(cfg: AutoCheckConfig):
     _sync_runtime_env_reload_state()
     _auto_check_restart.set()  # 唤醒巡检线程，立即应用新配置
     logger.info(
-        "[巡检] 配置已更新并持久化: 间隔=%ds 阈值=%d%% 触发=%d个",
+        "[巡检] 配置已更新并持久化: 间隔=%ds 目标seat=%d 阈值=%d%% 触发=%d个 add_phone自动重试=%s 最大重试=%d",
         _auto_check_config["interval"],
+        _auto_check_config["target_seats"],
         _auto_check_config["threshold"],
         _auto_check_config["min_low"],
+        "开" if _auto_check_config["retry_add_phone"] else "关",
+        _auto_check_config["add_phone_max_retries"],
     )
     return _auto_check_config.copy()
 
