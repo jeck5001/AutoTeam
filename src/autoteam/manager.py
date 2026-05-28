@@ -60,12 +60,15 @@ from autoteam.config import get_playwright_launch_options
 from autoteam.cpa_sync import sync_from_cpa
 from autoteam.mail_provider import (
     get_account_mail_provider,
+    get_account_mail_service_id,
     get_mail_client_for_account,
     get_mail_domain,
-    get_mail_provider_name,
+    get_mail_services,
+    infer_mail_provider_from_email,
+    infer_mail_service_from_email,
 )
 from autoteam.mail_provider import (
-    get_mail_client as CloudMailClient,
+    get_mail_client as get_mail_client,
 )
 from autoteam.signup_profile import SignupProfile, generate_signup_profile
 from autoteam.sync_targets import (
@@ -81,6 +84,9 @@ logger = logging.getLogger(__name__)
 MAIL_TIMEOUT = int(os.environ.get("MAIL_TIMEOUT", "180"))
 REUSE_RESET_GRACE_SECONDS = int(os.environ.get("REUSE_RESET_GRACE_SECONDS", "300"))
 
+# 兼容旧调用名：现在返回“默认邮箱服务”的客户端，不再只指向 CloudMail。
+CloudMailClient = get_mail_client
+
 
 def _chatgpt_session_ready(chatgpt_api) -> bool:
     if not chatgpt_api:
@@ -92,6 +98,15 @@ def _chatgpt_session_ready(chatgpt_api) -> bool:
         except Exception:
             pass
     return bool(getattr(chatgpt_api, "browser", None))
+
+
+def _abort_if_cancel_requested():
+    try:
+        from autoteam.api import ensure_current_task_not_cancelled
+    except ImportError:
+        return
+
+    ensure_current_task_not_cancelled()
 
 
 AUTH_REPAIR_HARD_FAILURE_TYPES = {"human_verification"}
@@ -132,20 +147,46 @@ def _auto_reuse_skip_reason(acc: dict | None) -> str | None:
 
 def _get_account_mail_client(acc: dict | None):
     acc = acc or {}
-    has_explicit_mail_binding = bool(acc.get("mail_provider")) or acc.get("mail_account_id") is not None
+    has_explicit_mail_binding = (
+        bool(acc.get("mail_service_id")) or bool(acc.get("mail_provider")) or acc.get("mail_account_id") is not None
+    )
     has_legacy_cloudmail_binding = acc.get("cloudmail_account_id") is not None
-    if has_explicit_mail_binding or has_legacy_cloudmail_binding:
+    if has_explicit_mail_binding or has_legacy_cloudmail_binding or infer_mail_service_from_email(acc.get("email")):
         return get_mail_client_for_account(acc)
-    return CloudMailClient()
+
+    services = get_mail_services()
+    if len(services) == 1:
+        return get_mail_client(service=services[0])
+    if not services:
+        return CloudMailClient()
+
+    email = _normalized_email(acc.get("email"))
+    raise ValueError(
+        f"无法唯一确定账号 {email or '<unknown>'} 对应的邮箱服务，请补充 mail_service_id 或确保邮箱域名只匹配一个服务"
+    )
+
+
+def _account_mail_cache_key(acc: dict | None) -> str:
+    acc = acc or {}
+    service_id = get_account_mail_service_id(acc)
+    if service_id:
+        return f"service:{service_id}"
+    provider = get_account_mail_provider(acc, default_provider="")
+    if provider:
+        return f"provider:{provider}"
+    return "default"
 
 
 def _can_attempt_auth_repair(acc: dict | None, mail_domain_suffix: str = "") -> bool:
     acc = acc or {}
     if (
-        bool(acc.get("mail_provider"))
+        bool(acc.get("mail_service_id"))
+        or bool(acc.get("mail_provider"))
         or acc.get("mail_account_id") is not None
         or acc.get("cloudmail_account_id") is not None
     ):
+        return True
+    if infer_mail_service_from_email(acc.get("email")):
         return True
     email = _normalized_email(acc.get("email"))
     return bool(mail_domain_suffix and mail_domain_suffix in email)
@@ -269,6 +310,7 @@ def _auth_repair_add_phone_retry_delays(max_retries: int | None = None) -> tuple
 def _auth_repair_error_label(error_type: str | None) -> str:
     mapping = {
         "add_phone": "手机号验证",
+        "choose_account_selection": "账号选择未完成",
         "human_verification": "人机验证",
         "email_verification": "邮箱验证码页卡住",
         "workspace_selection": "workspace 选择未完成",
@@ -353,13 +395,14 @@ def _record_auth_repair_failure(
     error_detail: str | None = None,
     *,
     chatgpt_api=None,
+    release_team_seat: bool = False,
 ) -> dict:
     now = time.time()
     acc = find_account(load_accounts(), email) or {"email": email}
     error_type = error_type or "login_failed"
     error_detail = error_detail or _auth_repair_error_label(error_type)
     retry_delays = _auth_repair_retry_delays()
-    release_team_seat = False
+    should_release_team_seat = bool(release_team_seat)
 
     if error_type == "add_phone" and _auth_repair_retry_add_phone_enabled():
         prev_count = int(acc.get("auth_retry_count") or 0) if acc.get("auth_last_error") == "add_phone" else 0
@@ -376,7 +419,7 @@ def _record_auth_repair_failure(
                 "auth_retry_after": None,
                 "auth_retry_paused": True,
             }
-            release_team_seat = True
+            should_release_team_seat = True
         else:
             state = {
                 "auth_retry_count": next_count,
@@ -419,7 +462,7 @@ def _record_auth_repair_failure(
     release_attempted = False
     remove_status = None
     seat_released = False
-    if release_team_seat and is_team_member:
+    if should_release_team_seat and is_team_member:
         release_attempted = True
         remove_status = _release_auth_repair_team_seat(email, chatgpt_api=chatgpt_api)
         seat_released = remove_status in ("removed", "already_absent")
@@ -575,15 +618,24 @@ def sync_account_states(chatgpt_api=None):
             chatgpt_api.stop()
 
     # 对照更新状态
-    domain_value = get_mail_domain()
-    domain_suffix = domain_value.lstrip("@") if domain_value else ""
-    current_mail_provider = get_mail_provider_name()
-
     changed = False
     local_email_set = {a["email"].lower() for a in accounts}
 
     for acc in accounts:
         email = acc["email"].lower()
+        inferred_service_id = infer_mail_service_from_email(email)
+        inferred_provider = infer_mail_provider_from_email(email)
+        if inferred_service_id and not acc.get("mail_service_id"):
+            acc["mail_service_id"] = inferred_service_id
+            changed = True
+        if (
+            inferred_provider
+            and not acc.get("mail_provider")
+            and acc.get("mail_account_id") is None
+            and acc.get("cloudmail_account_id") is None
+        ):
+            acc["mail_provider"] = inferred_provider
+            changed = True
         in_team = email in team_emails
 
         if in_team:
@@ -609,29 +661,32 @@ def sync_account_states(chatgpt_api=None):
             changed = True
 
     # Team 中有我们域名但本地无记录的成员 → 自动添加
-    if domain_suffix:
-        for email in team_emails:
-            if _is_main_account_email(email):
-                continue
-            if domain_suffix in email and email not in local_email_set:
-                accounts.append(
-                    {
-                        "email": email,
-                        "password": "",
-                        "mail_provider": current_mail_provider,
-                        "mail_account_id": None,
-                        "cloudmail_account_id": None,
-                        "status": STATUS_AUTH_PENDING,
-                        "auth_file": None,
-                        "quota_exhausted_at": None,
-                        "quota_resets_at": None,
-                        "created_at": time.time(),
-                        "last_active_at": None,
-                        **_auth_repair_reset_fields(),
-                    }
-                )
-                changed = True
-                logger.info("[同步] 发现 Team 中新成员: %s（已添加到本地，状态=auth_pending）", email)
+    for email in team_emails:
+        if _is_main_account_email(email) or email in local_email_set:
+            continue
+        inferred_service_id = infer_mail_service_from_email(email)
+        inferred_provider = infer_mail_provider_from_email(email)
+        if not inferred_provider:
+            continue
+        accounts.append(
+            {
+                "email": email,
+                "password": "",
+                "mail_service_id": inferred_service_id or None,
+                "mail_provider": inferred_provider,
+                "mail_account_id": None,
+                "cloudmail_account_id": None,
+                "status": STATUS_AUTH_PENDING,
+                "auth_file": None,
+                "quota_exhausted_at": None,
+                "quota_resets_at": None,
+                "created_at": time.time(),
+                "last_active_at": None,
+                **_auth_repair_reset_fields(),
+            }
+        )
+        changed = True
+        logger.info("[同步] 发现 Team 中新成员: %s（已添加到本地，状态=auth_pending）", email)
 
     # auths 目录中有认证文件但本地无记录的 → 自动添加为 standby
     from autoteam.codex_auth import AUTH_DIR
@@ -647,11 +702,13 @@ def sync_account_states(chatgpt_api=None):
                 # 判断是否在 Team 中
                 in_team = email in team_emails
                 status = STATUS_ACTIVE if in_team else STATUS_STANDBY
+                inferred_service_id = infer_mail_service_from_email(email)
                 accounts.append(
                     {
                         "email": email,
                         "password": "",
-                        "mail_provider": current_mail_provider,
+                        "mail_service_id": inferred_service_id or None,
+                        "mail_provider": infer_mail_provider_from_email(email),
                         "mail_account_id": None,
                         "cloudmail_account_id": None,
                         "status": status,
@@ -842,6 +899,8 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
     """检查可用账号额度，并尝试修复 Team 内认证未就绪的账号"""
     from autoteam.config import AUTO_CHECK_THRESHOLD
 
+    _abort_if_cancel_requested()
+
     # API 运行时配置优先（前端可修改）
     try:
         from autoteam.api import _auto_check_config
@@ -856,7 +915,7 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
     if pending_accounts:
         logger.info("[检查] 对账 %d 个 pending 账号...", len(pending_accounts))
         chatgpt = None
-        mail_client = None
+        pending_mail_clients = {}
         deleted_pending = 0
         try:
             chatgpt = ChatGPTTeamAPI()
@@ -866,6 +925,7 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
             invite_emails = {(inv.get("email_address") or inv.get("email") or "").lower() for inv in invites}
 
             for acc in pending_accounts:
+                _abort_if_cancel_requested()
                 email = acc["email"]
                 email_l = email.lower()
 
@@ -880,10 +940,12 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
                     continue
 
                 logger.warning("[检查] pending 账号为失败孤儿，删除: %s", email)
-                desired_provider = get_account_mail_provider(acc)
-                if mail_client is None or getattr(mail_client, "provider_name", "") != desired_provider:
+                cache_key = _account_mail_cache_key(acc)
+                mail_client = pending_mail_clients.get(cache_key)
+                if mail_client is None:
                     mail_client = _get_account_mail_client(acc)
                     mail_client.login()
+                    pending_mail_clients[cache_key] = mail_client
                 delete_managed_account(
                     email,
                     remove_remote=True,
@@ -958,6 +1020,7 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
     if active_with_auth:
         logger.info("[检查] 检查 %d 个 active/auth_pending 账号的额度...", len(active_with_auth))
         for acc in active_with_auth:
+            _abort_if_cancel_requested()
             email = acc["email"]
             was_auth_pending = acc["status"] == STATUS_AUTH_PENDING
             status_str, info = _check_and_refresh(acc)
@@ -1110,15 +1173,16 @@ def cmd_check(force_auth_repair=False, preserve_low_active=False, preserved_low_
         logger.info("[检查] 重新登录 %d 个认证失效/待修复的账号...", len(auth_error_list))
         mail_clients = {}
         for acc in auth_error_list:
+            _abort_if_cancel_requested()
             email = acc["email"]
             password = acc.get("password", "")
             logger.info("[%s] 重新 Codex 登录...", email)
-            provider = get_account_mail_provider(acc)
-            mail_client = mail_clients.get(provider)
+            cache_key = _account_mail_cache_key(acc)
+            mail_client = mail_clients.get(cache_key)
             if mail_client is None:
                 mail_client = _get_account_mail_client(acc)
                 mail_client.login()
-                mail_clients[provider] = mail_client
+                mail_clients[cache_key] = mail_client
             login_result = _login_codex_with_result(email, password, mail_client=mail_client)
             bundle = login_result.get("bundle")
             if login_result.get("ok") and bundle:
@@ -1300,7 +1364,12 @@ def _complete_registration(email, password, invite_link, mail_client):
         logger.info("[注册] 账号就绪: %s", email)
         return email
     else:
-        result = _record_auth_repair_failure(email, login_result.get("error_type"), login_result.get("error_detail"))
+        result = _record_auth_repair_failure(
+            email,
+            login_result.get("error_type"),
+            login_result.get("error_detail"),
+            release_team_seat=True,
+        )
         extra = _auth_repair_result_suffix(result)
         logger.warning(
             "[注册] 账号已加入 Team 但 Codex 登录失败，标记为 %s: %s（%s%s）",
@@ -1309,7 +1378,7 @@ def _complete_registration(email, password, invite_link, mail_client):
             _auth_repair_error_label(result.get("auth_last_error")),
             extra,
         )
-        return email
+        return None
 
 
 def _check_pending_invites(chatgpt_api, mail_client):
@@ -1359,7 +1428,12 @@ def _check_pending_invites(chatgpt_api, mail_client):
             password = acc.get("password", f"Tmp_{uuid.uuid4().hex[:12]}!")
         else:
             password = f"Tmp_{uuid.uuid4().hex[:12]}!"
-            add_account(inv_email, password)
+            add_account(
+                inv_email,
+                password,
+                mail_provider=getattr(mail_client, "provider_name", ""),
+                mail_service_id=getattr(mail_client, "service_id", None),
+            )
 
         # 关闭 ChatGPT 浏览器再注册
         chatgpt_api.stop()
@@ -1617,6 +1691,8 @@ def _detect_direct_register_step(page):
     url = (page.url or "").lower()
     if _is_google_redirect(page):
         return "google"
+    if "/api/auth/error" in url or url.endswith("/auth/error"):
+        return "error"
 
     if "email-verification" in url:
         return "code"
@@ -1662,6 +1738,8 @@ def _wait_for_direct_register_step(page, allowed_steps, timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
         step = _detect_direct_register_step(page)
+        if step == "error":
+            return step
         if step in allowed_steps:
             return step
         time.sleep(0.5)
@@ -1927,6 +2005,14 @@ def _register_direct_once(
             logger.warning("[直接注册] 邮箱步骤仍停留在 Google 登录页")
             browser.close()
             return False
+        if current_step == "error":
+            logger.warning("[直接注册] 邮箱步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
+            browser.close()
+            return False
+        if current_step == "unknown":
+            logger.warning("[直接注册] 邮箱步骤进入未知状态 | URL: %s | body=%s", page.url, _page_excerpt(page))
+            browser.close()
+            return False
         if current_step == "email":
             logger.warning("[直接注册] 邮箱步骤未推进 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
@@ -1940,6 +2026,14 @@ def _register_direct_once(
         )
         logger.info("[直接注册] 密码页检测状态: %s | URL: %s", password_step, page.url)
         _safe_invite_screenshot(page, "direct_03b_before_password.png")
+        if password_step == "error":
+            logger.warning("[直接注册] 密码步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
+            browser.close()
+            return False
+        if password_step == "unknown":
+            logger.warning("[直接注册] 无法识别密码/验证码步骤 | URL: %s | body=%s", page.url, _page_excerpt(page))
+            browser.close()
+            return False
 
         try:
             for attempt in range(2):
@@ -1986,6 +2080,14 @@ def _register_direct_once(
         current_step = _detect_direct_register_step(page)
         if current_step == "google":
             logger.warning("[直接注册] 密码步骤仍停留在 Google 登录页")
+            browser.close()
+            return False
+        if current_step == "error":
+            logger.warning("[直接注册] 密码步骤进入认证错误页 | URL: %s | body=%s", page.url, _page_excerpt(page))
+            browser.close()
+            return False
+        if current_step == "unknown":
+            logger.warning("[直接注册] 密码步骤进入未知状态 | URL: %s | body=%s", page.url, _page_excerpt(page))
             browser.close()
             return False
         if current_step == "email":
@@ -2107,6 +2209,7 @@ def create_account_direct(mail_client):
         cloudmail_account_id=account_id if getattr(mail_client, "provider_name", "") == "cloudmail" else None,
         mail_provider=getattr(mail_client, "provider_name", ""),
         mail_account_id=account_id,
+        mail_service_id=getattr(mail_client, "service_id", None),
     )
 
     # Step 4: Codex 登录
@@ -2124,7 +2227,12 @@ def create_account_direct(mail_client):
         logger.info("[直接注册] 账号就绪: %s", email)
         return email
     else:
-        result = _record_auth_repair_failure(email, login_result.get("error_type"), login_result.get("error_detail"))
+        result = _record_auth_repair_failure(
+            email,
+            login_result.get("error_type"),
+            login_result.get("error_detail"),
+            release_team_seat=True,
+        )
         extra = _auth_repair_result_suffix(result)
         logger.warning(
             "[直接注册] 账号已加入 Team 但 Codex 登录失败，标记为 %s: %s（%s%s）",
@@ -2133,7 +2241,7 @@ def create_account_direct(mail_client):
             _auth_repair_error_label(result.get("auth_last_error")),
             extra,
         )
-        return email
+        return None
 
 
 def create_new_account(chatgpt_api, mail_client):
@@ -2178,6 +2286,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             login_result.get("error_type"),
             login_result.get("error_detail"),
             chatgpt_api=chatgpt_api,
+            release_team_seat=True,
         )
         extra = _auth_repair_result_suffix(result)
         logger.warning(
@@ -2197,6 +2306,7 @@ def reinvite_account(chatgpt_api, mail_client, acc):
             "non_team_plan",
             f"登录后 plan={plan_type or 'unknown'}",
             chatgpt_api=chatgpt_api,
+            release_team_seat=True,
         )
         logger.warning("[轮转] 旧账号保持状态为 %s: %s", result.get("status"), email)
         return False
@@ -2219,6 +2329,8 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
     4. 优先从 standby 中选额度已恢复的旧账号填补
     5. 仅当所有旧账号都不可用时，才创建新账号
     """
+    _abort_if_cancel_requested()
+
     TARGET = target_seats
     ACTIVE_TARGET = _pool_active_target(TARGET)
 
@@ -2250,12 +2362,12 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         return mail_client
 
     def ensure_account_mail(acc):
-        provider = get_account_mail_provider(acc)
-        client = reuse_mail_clients.get(provider)
+        cache_key = _account_mail_cache_key(acc)
+        client = reuse_mail_clients.get(cache_key)
         if client is None:
             client = _get_account_mail_client(acc)
             client.login()
-            reuse_mail_clients[provider] = client
+            reuse_mail_clients[cache_key] = client
         return client
 
     def refresh_current_count(current_count, stage_label):
@@ -2355,6 +2467,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         return "ready"
 
     def attempt_seat2_preswitch(low_candidates, current_count):
+        _abort_if_cancel_requested()
         if TARGET != 2 or current_count != TARGET or not low_candidates:
             return {"attempted": False, "current_count": current_count}
 
@@ -2372,6 +2485,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
 
         replacement_email = None
         for acc in standby_list:
+            _abort_if_cancel_requested()
             if evaluate_standby_reuse(acc, "[4/5][预切换]") != "ready":
                 continue
 
@@ -2384,6 +2498,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
                 break
 
         if not replacement_email:
+            _abort_if_cancel_requested()
             logger.info("[5/5] seat=2 预切换：尝试创建新账号...")
             created_email = create_new_account(chatgpt, ensure_mail())
             if created_email and managed_account_ready(created_email):
@@ -2429,6 +2544,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
     sync_account_states()
 
     logger.info("[2/5] 检查额度...")
+    _abort_if_cancel_requested()
     preserved_low_accounts = []
     try:
         cmd_check(
@@ -2443,6 +2559,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
             cmd_check()
 
     try:
+        _abort_if_cancel_requested()
         # 移出所有 exhausted 账号（包括之前已标记的）
         all_accounts = load_accounts()
         all_exhausted = [
@@ -2459,6 +2576,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         preswitch_result = {"attempted": False}
 
         if TARGET == 2 and all_exhausted:
+            _abort_if_cancel_requested()
             ensure_chatgpt()
             initial_api_count = get_team_member_count(chatgpt)
             preswitch_candidates = list(preserved_low_accounts or [])
@@ -2468,6 +2586,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
                 if _normalized_email(item.get("email"))
             }
             for acc in all_exhausted:
+                _abort_if_cancel_requested()
                 email = _normalized_email(acc.get("email"))
                 if not email or email in seen_preswitch_emails:
                     continue
@@ -2501,6 +2620,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
             if initial_api_count < 0 or not preswitch_attempted:
                 initial_api_count = get_team_member_count(chatgpt)
             for acc in all_exhausted:
+                _abort_if_cancel_requested()
                 email = acc["email"]
                 if not _chatgpt_session_ready(chatgpt):
                     chatgpt.start()
@@ -2548,6 +2668,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         vacancies = TARGET - current_count
 
         if vacancies <= 0 and TARGET == 2 and current_count == TARGET and preserved_low_accounts:
+            _abort_if_cancel_requested()
             preswitch_result = attempt_seat2_preswitch(preserved_low_accounts, current_count)
             if preswitch_result.get("attempted"):
                 current_count = preswitch_result.get("current_count", current_count)
@@ -2576,6 +2697,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
                 )
                 removed = 0
                 for acc in local_seat_accounts:
+                    _abort_if_cancel_requested()
                     if removed >= excess:
                         break
                     email = acc["email"]
@@ -2619,6 +2741,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
         retry_throttled = []
 
         for acc in standby_list:
+            _abort_if_cancel_requested()
             if filled >= vacancies:
                 break
             email = acc["email"]
@@ -2677,6 +2800,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
             # 必须创建新号
             logger.info("[5/5] 创建 %d 个新账号...", remaining)
             for i in range(remaining):
+                _abort_if_cancel_requested()
                 logger.info("[5/5] 创建第 %d/%d 个...", i + 1, remaining)
                 if not _chatgpt_session_ready(chatgpt):
                     ensure_chatgpt()
@@ -2727,12 +2851,14 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
 
 def cmd_add():
     """手动添加一个新账号"""
+    _abort_if_cancel_requested()
     chatgpt = ChatGPTTeamAPI()
     chatgpt.start()
     mail_client = CloudMailClient()
     mail_client.login()
 
     try:
+        _abort_if_cancel_requested()
         result = create_new_account(chatgpt, mail_client)  # 内部会 stop chatgpt
         if result:
             logger.info("[添加] 新账号添加成功: %s", result)
@@ -2963,6 +3089,7 @@ def get_team_member_count(chatgpt_api):
 
 def cmd_fill(target=5):
     """检测 Team 成员数，不足 target 则自动添加新账号补满"""
+    _abort_if_cancel_requested()
     chatgpt = ChatGPTTeamAPI()
     chatgpt.start()
     mail_client = CloudMailClient()
@@ -2970,15 +3097,16 @@ def cmd_fill(target=5):
     reuse_mail_clients = {}
 
     def ensure_account_mail(acc):
-        provider = get_account_mail_provider(acc)
-        client = reuse_mail_clients.get(provider)
+        cache_key = _account_mail_cache_key(acc)
+        client = reuse_mail_clients.get(cache_key)
         if client is None:
             client = _get_account_mail_client(acc)
             client.login()
-            reuse_mail_clients[provider] = client
+            reuse_mail_clients[cache_key] = client
         return client
 
     try:
+        _abort_if_cancel_requested()
         current = get_team_member_count(chatgpt)
         if current < 0:
             logger.error("[填充] 获取成员列表失败")
@@ -3000,11 +3128,13 @@ def cmd_fill(target=5):
         standby_index = 0
 
         for i in range(need):
+            _abort_if_cancel_requested()
             logger.info("[填充] 添加第 %d/%d 个账号...", i + 1, need)
 
             # 优先复用 standby 中额度已恢复的旧账号
             added = False
             while standby_index < len(standby_list):
+                _abort_if_cancel_requested()
                 reusable = standby_list[standby_index]
                 standby_index += 1
                 email = reusable["email"]
@@ -3026,6 +3156,7 @@ def cmd_fill(target=5):
                 logger.warning("[填充] 复用旧账号失败，尝试下一个旧账号: %s", email)
 
             if not added:
+                _abort_if_cancel_requested()
                 # 创建新账号
                 logger.info("[填充] 创建新账号...")
                 if not _chatgpt_session_ready(chatgpt):
@@ -3057,6 +3188,7 @@ def cmd_fill(target=5):
 
 def cmd_cleanup(max_seats=None):
     """清理多余的 Team 成员，只移除本地 accounts.json 中管理的账号"""
+    _abort_if_cancel_requested()
     account_id = get_chatgpt_account_id()
     accounts = load_accounts()
     local_emails = {a["email"].lower() for a in accounts if not _is_main_account_email(a.get("email"))}
@@ -3069,6 +3201,7 @@ def cmd_cleanup(max_seats=None):
     chatgpt.start()
 
     try:
+        _abort_if_cancel_requested()
         # 获取当前成员列表
         path = f"/backend-api/accounts/{account_id}/users"
         result = chatgpt._api_fetch("GET", path)
@@ -3087,6 +3220,7 @@ def cmd_cleanup(max_seats=None):
         local_members = []
         external_members = []
         for m in members:
+            _abort_if_cancel_requested()
             email = m.get("email", "").lower()
             if email in local_emails:
                 local_members.append(m)
@@ -3132,6 +3266,7 @@ def cmd_cleanup(max_seats=None):
 
         # 执行移除
         for m in to_remove:
+            _abort_if_cancel_requested()
             email = m.get("email", "")
             user_id = m.get("user_id") or m.get("id")
 
@@ -3152,6 +3287,7 @@ def cmd_cleanup(max_seats=None):
                 inv_data if isinstance(inv_data, list) else inv_data.get("invites", inv_data.get("account_invites", []))
             )
             for inv in invites:
+                _abort_if_cancel_requested()
                 inv_email = inv.get("email_address", "").lower()
                 inv_id = inv.get("id")
                 if inv_email in local_emails and inv_id:
@@ -3168,6 +3304,7 @@ def cmd_cleanup(max_seats=None):
 
 def cmd_reset_quota_recovery():
     """清空所有托管非主号账号的本地额度恢复记录。"""
+    _abort_if_cancel_requested()
     accounts = load_accounts()
     if not accounts:
         summary = {
@@ -3185,6 +3322,7 @@ def cmd_reset_quota_recovery():
     rearmed_to_auth_pending = 0
 
     for acc in accounts:
+        _abort_if_cancel_requested()
         email = acc.get("email", "")
         if _is_main_account_email(email):
             continue

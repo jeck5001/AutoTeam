@@ -419,6 +419,112 @@ def test_get_runtime_config_switches_required_mail_fields_by_provider(tmp_path, 
     assert fields["CLOUDMAIL_EMAIL"]["runtime_required"] is False
 
 
+def test_get_runtime_config_exposes_structured_mail_services(tmp_path, monkeypatch):
+    services = [
+        {
+            "id": "cm-1",
+            "type": "cloudmail",
+            "base_url": "https://mail.example.com/api",
+            "email": "admin@example.com",
+            "password": "secret-1",
+            "domain": "pool.example.com",
+        },
+        {
+            "id": "cf-1",
+            "type": "cloudflare_temp_email",
+            "base_url": "https://temp.example.com",
+            "admin_password": "secret-2",
+            "domain": "mail.example.com",
+        },
+    ]
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"MAIL_SERVICES_JSON={json.dumps(services, separators=(',', ':'))}",
+                "MAIL_SERVICE_DEFAULT=cf-1",
+                "API_KEY=runtime-key",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("autoteam.setup_wizard.ENV_FILE", env_file)
+    for key in (
+        "MAIL_SERVICES_JSON",
+        "MAIL_SERVICE_DEFAULT",
+        "MAIL_PROVIDER",
+        "CLOUDMAIL_BASE_URL",
+        "CLOUDMAIL_EMAIL",
+        "CLOUDMAIL_PASSWORD",
+        "CLOUDMAIL_DOMAIN",
+        "CF_TEMP_EMAIL_BASE_URL",
+        "CF_TEMP_EMAIL_ADMIN_PASSWORD",
+        "CF_TEMP_EMAIL_DOMAIN",
+        "API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    result = api.get_runtime_config()
+
+    assert [item["id"] for item in result["mail_services"]] == ["cm-1", "cf-1"]
+    assert result["mail_service_default"] == "cf-1"
+    fields = {field["key"]: field for field in result["fields"]}
+    assert fields["MAIL_PROVIDER"]["value"] == "cloudflare_temp_email"
+
+
+def test_put_runtime_config_saves_structured_mail_services_and_mirrors_default(monkeypatch):
+    written = {}
+
+    services = [
+        {
+            "id": "cm-1",
+            "type": "cloudmail",
+            "base_url": "https://mail.example.com/api",
+            "email": "admin@example.com",
+            "password": "secret-1",
+            "domain": "pool.example.com",
+        },
+        {
+            "id": "cf-1",
+            "type": "cloudflare_temp_email",
+            "base_url": "https://temp.example.com",
+            "admin_password": "secret-2",
+            "domain": "mail.example.com",
+        },
+    ]
+
+    monkeypatch.setattr("autoteam.setup_wizard._write_env", lambda key, value: written.__setitem__(key, value))
+    monkeypatch.setattr("autoteam.setup_wizard._verify_mail_service", lambda service=None: True)
+    monkeypatch.setattr("importlib.reload", lambda module: module)
+    monkeypatch.setattr(api, "API_KEY", "old-key")
+    monkeypatch.setenv("API_KEY", "old-key")
+    monkeypatch.setenv("CLOUDMAIL_BASE_URL", "https://old-mail.example.com/api")
+    monkeypatch.setenv("CLOUDMAIL_EMAIL", "old@example.com")
+    monkeypatch.setenv("CLOUDMAIL_PASSWORD", "old-secret")
+    monkeypatch.setenv("CLOUDMAIL_DOMAIN", "@old.example.com")
+
+    result = api.put_runtime_config(
+        api.SetupConfig(
+            API_KEY="old-key",
+            mail_services=services,
+            mail_service_default="cf-1",
+        )
+    )
+
+    assert result["message"] == "配置保存成功"
+    assert json.loads(written["MAIL_SERVICES_JSON"])[1]["id"] == "cf-1"
+    assert written["MAIL_SERVICE_DEFAULT"] == "cf-1"
+    assert written["MAIL_PROVIDER"] == "cloudflare_temp_email"
+    assert written["CF_TEMP_EMAIL_BASE_URL"] == "https://temp.example.com"
+    assert written["CF_TEMP_EMAIL_ADMIN_PASSWORD"] == "secret-2"
+    assert written["CF_TEMP_EMAIL_DOMAIN"] == "mail.example.com"
+    assert written["CLOUDMAIL_BASE_URL"] == ""
+    assert written["CLOUDMAIL_EMAIL"] == ""
+    assert written["CLOUDMAIL_PASSWORD"] == ""
+    assert written["CLOUDMAIL_DOMAIN"] == ""
+
+
 def test_put_runtime_config_allows_partial_runtime_fields_when_api_key_exists(monkeypatch):
     written = {}
 
@@ -890,6 +996,63 @@ def test_post_reset_quota_starts_background_task_without_admin_or_pool_config(mo
 
     assert result == {"task_id": "reset-quota"}
     assert started == [("reset-quota", "cmd_reset_quota_recovery", {}, (), {})]
+
+
+def test_cancel_task_marks_running_task_as_cancelling(monkeypatch):
+    task = {
+        "task_id": "task-1",
+        "command": "rotate",
+        "params": {},
+        "status": "running",
+        "created_at": time.time(),
+        "started_at": time.time(),
+        "finished_at": None,
+        "result": None,
+        "error": None,
+        "cancel_requested": False,
+        "cancel_requested_at": None,
+        "cancel_message": "任务已终止",
+    }
+
+    monkeypatch.setattr(api, "_tasks", {"task-1": task})
+
+    result = api.cancel_task("task-1")
+
+    assert result["task_id"] == "task-1"
+    assert result["status"] == "cancelling"
+    assert task["status"] == "cancelling"
+    assert task["cancel_requested"] is True
+    assert task["cancel_requested_at"] is not None
+    assert task["error"] == "任务终止中"
+
+
+def test_run_task_marks_cancel_requested_task_as_cancelled(monkeypatch):
+    task = {
+        "task_id": "task-1",
+        "command": "fill",
+        "params": {},
+        "status": "pending",
+        "created_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "result": None,
+        "error": None,
+        "cancel_requested": True,
+        "cancel_requested_at": time.time(),
+        "cancel_message": "任务已终止",
+    }
+
+    monkeypatch.setattr(api, "_tasks", {"task-1": task})
+    monkeypatch.setattr(api, "_playwright_lock", threading.Lock())
+    monkeypatch.setattr(api, "_current_task_id", None)
+
+    api._run_task("task-1", lambda: (_ for _ in ()).throw(AssertionError("should not run")))
+
+    assert task["status"] == "cancelled"
+    assert task["error"] == "任务已终止"
+    assert task["started_at"] is not None
+    assert task["finished_at"] is not None
+    assert api._current_task_id is None
 
 
 @pytest.mark.parametrize(
